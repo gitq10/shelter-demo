@@ -1,193 +1,195 @@
-import time, math, os
+import os, time, json
+import pandas as pd
+import numpy as np
 import streamlit as st
 import pydeck as pdk
 
-st.set_page_config(page_title="Nearest Safe Shelter (Demo)", layout="wide")
+st.set_page_config(page_title="Grid 50s Real-Time Demo", layout="wide")
 
-# ----------------------------
-# Grandma settings (edit these)
-# ----------------------------
-# Default "home" (central Kyiv). Change for other city.
-HOME_LAT, HOME_LON = 50.4501, 30.5234
+# ===== CONFIG =====
+DATA_FILE = "synthetic_grid_outage_50sec_5s.csv" # <-- use this exact filename
+TICK_SECONDS = 1.0   # refresh every 1s
+WINDOW_SECONDS = 120 # show last 2 minutes in view (even though file is 50s)
 
-# Demo shelters (you can edit/add rows here)
-SHELTERS = [
-    {"name":"Khreshchatyk Metro","lat":50.4479,"lon":30.5227},
-    {"name":"Teatralna Metro","lat":50.4443,"lon":30.5180},
-    {"name":"Zoloti Vorota Metro","lat":50.4472,"lon":30.5157},
-    {"name":"Maidan Nezalezhnosti","lat":50.4500,"lon":30.5233},
-    {"name":"Arsenalna Metro","lat":50.4415,"lon":30.5539},
-    {"name":"Universytet Metro","lat":50.4432,"lon":30.5050},
-]
+# ===== SESSION =====
+ss = st.session_state
+if "df" not in ss: ss.df = None
+if "replay_index" not in ss: ss.replay_index = 0
+if "running" not in ss: ss.running = True
 
-# Demo timeline pattern (seconds): ALERT/SAFE cycles to look alive
-PATTERN = [("ALERT",120), ("SAFE",60), ("ALERT",45), ("SAFE",90)]  # loops forever
-TICK_SECONDS = 1.0  # refresh cadence
+# ===== LOAD DATA =====
+def load_csv(path):
+    df = pd.read_csv(path, encoding="utf-8-sig")
+    expected = {"timestamp","asset_id","lat","lon",
+                "outage_prob","damage_index","crew_eta_min","criticality","customer_impact"}
+    missing = expected - set(df.columns)
+    if missing:
+        raise ValueError(f"CSV missing columns: {missing}")
+    if df["timestamp"].dtype == object:
+        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce", utc=True)
+    return df.sort_values(["timestamp","asset_id"]).reset_index(drop=True)
 
-# ----------------------------
-# Helpers
-# ----------------------------
-def haversine_km(lat1, lon1, lat2, lon2):
-    R = 6371.0
-    p1, p2 = math.radians(lat1), math.radians(lat2)
-    dphi = math.radians(lat2 - lat1)
-    dlmb = math.radians(lon2 - lon1)
-    a = math.sin(dphi/2)**2 + math.cos(p1)*math.cos(p2)*math.sin(dlmb/2)**2
-    return 2*R*math.asin(math.sqrt(a))
+if ss.df is None:
+    if not os.path.exists(DATA_FILE):
+        st.error(f"Can't find {DATA_FILE} next to app.py")
+        st.stop()
+    ss.df = load_csv(DATA_FILE)
 
-def pattern_length():
-    return sum(d for _, d in PATTERN)
+df_all = ss.df
+assets_count = df_all["asset_id"].nunique()
+total_rows = len(df_all)
 
-def state_at(t):
-    """Return (state, elapsed_in_state, remaining_in_state) for t seconds into the loop."""
-    t_mod = t % pattern_length()
-    cum = 0
-    for state, dur in PATTERN:
-        if t_mod < cum + dur:
-            elapsed = t_mod - cum
-            remain = dur - elapsed
-            return state, int(elapsed), int(remain)
-        cum += dur
-    return "SAFE", 0, PATTERN[1][1]  # fallback
+# ===== HELPERS =====
+def compute_composite(df):
+    if df.empty:
+        return df.assign(composite=np.nan)
+    outage = df["outage_prob"]
+    damage = df["damage_index"]
+    crit   = df["criticality"]
+    crew   = np.clip((df["crew_eta_min"]/180.0)*100.0, 0, 100)
+    comp = 0.40*damage + 0.30*outage + 0.20*crit - 0.10*crew
+    return df.assign(composite=np.clip(comp, 0, 100))
 
-# ----------------------------
-# Session
-# ----------------------------
-if "running" not in st.session_state:
-    st.session_state.running = True
-if "tick" not in st.session_state:
-    st.session_state.tick = 0
-if "home_lat" not in st.session_state:
-    st.session_state.home_lat = HOME_LAT
-if "home_lon" not in st.session_state:
-    st.session_state.home_lon = HOME_LON
+def now_timestamp():
+    if ss.replay_index == 0:
+        return df_all["timestamp"].min()
+    i = min(ss.replay_index-1, total_rows-1)
+    return df_all.iloc[i]["timestamp"]
 
-# ----------------------------
-# Sidebar controls
-# ----------------------------
+# ===== SIDEBAR =====
 st.sidebar.title("Controls")
-st.sidebar.write("**Mode:** synthetic timeline (1s ticks). Swap to real feeds later.")
 
-# Home picker
-st.sidebar.markdown("### Your location")
-st.session_state.home_lat = st.sidebar.number_input("Latitude", value=float(st.session_state.home_lat), step=0.0001, format="%.6f")
-st.session_state.home_lon = st.sidebar.number_input("Longitude", value=float(st.session_state.home_lon), step=0.0001, format="%.6f")
+with st.sidebar.expander("File Debug", expanded=False):
+    st.write("**Working directory:**", os.getcwd())
+    st.write("**Files here:**", os.listdir(".")[:50])
+    if os.path.exists(DATA_FILE):
+        st.success(f"{DATA_FILE} exists ✓ size: {os.path.getsize(DATA_FILE):,} bytes")
+    else:
+        st.error(f"{DATA_FILE} NOT FOUND")
 
-c1, c2, c3, c4 = st.sidebar.columns(4)
-if c1.button("▶ Start"): st.session_state.running = True
-if c2.button("⏸ Stop"):  st.session_state.running = False
-if c3.button("↺ Reset"): 
-    st.session_state.running = False
-    st.session_state.tick = 0
-if c4.button("🔥 Inject Alert"):
-    # Put the timeline at the start of an ALERT segment for drama
-    # (we align tick to the beginning of PATTERN[0], which is ALERT)
-    pass  # the pattern already starts with ALERT; you can add custom logic if needed
+# Playback
+c1, c2, c3 = st.sidebar.columns(3)
+if c1.button("▶ Start"): ss.running = True
+if c2.button("⏸ Stop"):  ss.running = False
+if c3.button("↺ Reset"):
+    ss.running = False
+    ss.replay_index = 0
 
+# Fast-Forward: each 5 seconds of data = one timestamp slice across all assets
 ff1, ff2, ff3 = st.sidebar.columns(3)
-if ff1.button("+30s"): st.session_state.tick += 30
-if ff2.button("+2m"):  st.session_state.tick += 120
-if ff3.button("+5m"):  st.session_state.tick += 300
+def fast_forward_slices(slices:int):
+    ss.replay_index = min(ss.replay_index + slices*assets_count, total_rows)
+if ff1.button("+2 slices"): fast_forward_slices(2)   # ~10s
+if ff2.button("+4 slices"): fast_forward_slices(4)   # ~20s
+if ff3.button("+8 slices"): fast_forward_slices(8)   # ~40s
 
-# ----------------------------
-# Compute current state
-# ----------------------------
-state, elapsed, remain = state_at(st.session_state.tick)
-is_alert = (state == "ALERT")
+# Inject Damage (for demo drama)
+st.sidebar.markdown("### Inject Damage")
+col_h1, col_h2 = st.sidebar.columns(2)
+hot_asset = col_h1.selectbox("Asset", sorted(df_all["asset_id"].unique()))
+hot_slices = col_h2.select_slider("Duration (slices)", [1,2,3,4,5], value=3)
+hot_boost = st.sidebar.slider("Magnitude (+damage)", 5, 50, 20, step=5)
+if st.sidebar.button("🔥 Inject"):
+    t0 = now_timestamp()
+    if pd.isna(t0):
+        st.sidebar.warning("Start the replay first.")
+    else:
+        # Pick a window starting now over N "slices" (timestamps)
+        times = df_all["timestamp"].drop_duplicates().sort_values()
+        # find start index
+        try:
+            i0 = times[times>=t0].index[0]
+        except Exception:
+            i0 = times.index[-1]
+        apply_times = times.iloc[times.get_indexer([i0], method='nearest')[0]:][:hot_slices]
+        mask = (df_all["asset_id"]==hot_asset) & (df_all["timestamp"].isin(apply_times))
+        df_all.loc[mask, "damage_index"] = np.clip(df_all.loc[mask, "damage_index"] + hot_boost, 0, 100)
+        df_all.loc[mask, "outage_prob"]  = np.clip(df_all.loc[mask, "outage_prob"]  + hot_boost*0.5, 0, 100)
+        df_all.loc[mask, "crew_eta_min"] = np.clip(df_all.loc[mask, "crew_eta_min"] + hot_boost*0.3, 5, 240)
+        st.sidebar.success(f"Injected on {hot_asset} for {len(apply_times)} slices.")
 
-# Rank shelters by distance
-home_lat, home_lon = st.session_state.home_lat, st.session_state.home_lon
-scored = []
-for s in SHELTERS:
-    d = haversine_km(home_lat, home_lon, s["lat"], s["lon"])
-    scored.append({**s, "dist_km": d, "eta_min": max(1, int(d*12))})  # walk ~5 km/h -> 12 min per km
+# ===== PRELOAD FIRST VIEW =====
+if ss.replay_index == 0:
+    # show first 2 slices immediately (for instant motion)
+    ss.replay_index = min(2*assets_count, total_rows)
 
-scored.sort(key=lambda x: x["dist_km"])
-top2 = scored[:2]
+# ===== ADVANCE POINTER =====
+if ss.running:
+    ss.replay_index = min(ss.replay_index + assets_count, total_rows)  # advance one 5s slice
+i = ss.replay_index
 
-# ----------------------------
-# Header status
-# ----------------------------
+# ===== BUILD CURRENT VIEW =====
 colA, colB = st.columns([1,3])
 
-with colA:
-    st.markdown("### Status")
-    if is_alert:
-        st.markdown(
-            f"<div style='padding:12px;border-radius:12px;background:#ffeded;color:#b00020;font-weight:700;'>"
-            f"🚨 ALERT — Go to shelter now<br/>Time remaining: {remain}s</div>", unsafe_allow_html=True)
-    else:
-        st.markdown(
-            f"<div style='padding:12px;border-radius:12px;background:#e7f7ee;color:#0b7a3b;font-weight:700;'>"
-            f"✅ SAFE — Stay ready<br/>Next change in ~{remain}s</div>", unsafe_allow_html=True)
+if i > 0:
+    buf = df_all.iloc[:i].copy()
+    # Keep only last WINDOW_SECONDS worth of data (based on timestamps)
+    if buf["timestamp"].notna().any():
+        t_max = buf["timestamp"].max()
+        if pd.notna(t_max):
+            buf = buf[buf["timestamp"] >= t_max - pd.Timedelta(seconds=WINDOW_SECONDS)]
+    buf = compute_composite(buf)
 
-    st.write(f"Tick: {st.session_state.tick}s • State elapsed: {elapsed}s")
+    # Status + recommendations
+    with colA:
+        st.markdown("### Status")
+        st.metric("Replay index", f"{i:,} / {total_rows:,}")
+        st.write("Playing:", "✅" if ss.running else "⏸️")
+        st.progress(i / max(total_rows, 1))
 
-    st.markdown("#### Nearest shelters")
-    for s in top2:
-        if is_alert:
-            st.write(f"**{s['name']}** — {s['dist_km']:.2f} km • ~{s['eta_min']} min walk")
-        else:
-            st.write(f"{s['name']} — {s['dist_km']:.2f} km • ~{s['eta_min']} min")
+        # Simple recs
+        recs = []
+        grp = buf.groupby("asset_id").agg(
+            comp=("composite","mean"),
+            dmg=("damage_index","mean"),
+            out=("outage_prob","mean"),
+            crew=("crew_eta_min","mean"),
+            cust=("customer_impact","mean")
+        ).reset_index()
+        for _, r in grp.iterrows():
+            if r["comp"]>80 and r["cust"]>10000:
+                recs.append({"asset": r["asset_id"], "priority": 1,
+                             "action":"Dispatch nearest crew; backfeed & partial load-shed; UAV recon",
+                             "why": f"Composite {r['comp']:.0f}, customers {int(r['cust']):,}"})
+            if r["dmg"]>70 and r["crew"]>45:
+                recs.append({"asset": r["asset_id"], "priority": 2,
+                             "action":"Re-route standby crew; pre-position spares",
+                             "why": f"Damage {r['dmg']:.0f} and crew ETA {r['crew']:.0f}m"})
+        recs = sorted(recs, key=lambda x: x["priority"])[:6]
+        if recs:
+            st.markdown("#### Recommendations")
+            for r in recs:
+                st.write(f"**{r['asset']}** — {r['action']}  \n*Why:* {r['why']}")
+            # Downloads
+            rec_df = pd.DataFrame(recs)
+            st.download_button("📥 Actions (CSV)", data=rec_df.to_csv(index=False).encode("utf-8"),
+                               file_name="actions.csv", mime="text/csv")
+            st.download_button("📥 Actions (JSON)", data=json.dumps(recs, indent=2).encode("utf-8"),
+                               file_name="actions.json", mime="application/json")
 
-    st.markdown("#### What to do")
-    if is_alert:
-        st.write("- Move now to the **closest shelter** shown above.")
-        st.write("- If outside: get **underground** or behind **two walls** away from windows.")
-        st.write("- Bring essentials (ID, phone, power bank).")
-    else:
-        st.write("- Keep devices charged, shoes ready, and know your route.")
-        st.write("- Practice the walk to your primary & backup shelter.")
+    # Map + table
+    center_lat = float(buf["lat"].mean()) if len(buf) else 48.5
+    center_lon = float(buf["lon"].mean()) if len(buf) else 36.5
+    layer = pdk.Layer(
+        "HeatmapLayer",
+        data=buf,
+        get_position='[lon, lat]',
+        get_weight='composite',
+        radiusPixels=40,
+    )
+    deck = pdk.Deck(
+        initial_view_state=pdk.ViewState(latitude=center_lat, longitude=center_lon, zoom=6),
+        layers=[layer],
+        tooltip={"text": "{asset_id}\\nComposite={composite:.1f}\\nDamage={damage_index:.1f}\\nOutage={outage_prob:.1f}\\nETA={crew_eta_min:.0f}m"}
+    )
+    with colB:
+        st.pydeck_chart(deck)
+        st.dataframe(buf.tail(30), use_container_width=True)
+else:
+    with colB:
+        st.info("Click ▶ Start to play.")
 
-# ----------------------------
-# Map
-# ----------------------------
-# Build map layers: home + shelters
-home_layer = pdk.Layer(
-    "ScatterplotLayer",
-    data=[{"name":"You","lat":home_lat,"lon":home_lon}],
-    get_position='[lon, lat]',
-    get_radius=60,
-    get_fill_color='[200, 30, 30]' if is_alert else '[30, 160, 60]',
-    pickable=True
-)
-
-shelter_layer = pdk.Layer(
-    "ScatterplotLayer",
-    data=SHELTERS,
-    get_position='[lon, lat]',
-    get_radius=50,
-    get_fill_color='[30, 120, 200]',
-    pickable=True
-)
-
-# Optional: highlight lines to top2 shelters
-paths = []
-for s in top2:
-    paths.append({"path":[[home_lon, home_lat],[s["lon"], s["lat"]]], "name":f"→ {s['name']}"})
-path_layer = pdk.Layer(
-    "PathLayer",
-    data=paths,
-    get_path="path",
-    width_scale=2,
-    get_width=5,
-    get_color=[255, 140, 0] if is_alert else [120,120,120],
-    pickable=True
-)
-
-deck = pdk.Deck(
-    initial_view_state=pdk.ViewState(latitude=home_lat, longitude=home_lon, zoom=13),
-    layers=[home_layer, shelter_layer, path_layer],
-    tooltip={"text": "{name}"}
-)
-with colB:
-    st.pydeck_chart(deck)
-    st.caption("Blue = shelters, Green/Red = your location, Orange lines = nearest routes")
-
-# ----------------------------
-# Auto-tick & rerun
-# ----------------------------
-if st.session_state.running:
+# ===== AUTO-RERUN =====
+if ss.running:
     time.sleep(TICK_SECONDS)
-    st.session_state.tick += 1
     st.rerun()
